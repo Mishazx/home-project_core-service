@@ -115,6 +115,70 @@ def _http_multipart(path: str, fields: Dict[str, str], file_field: str, filename
             pass
 
 
+def _http_multipart_stream(path: str, fields: Dict[str, str], file_field: str, filename: str, file_path: str, file_content_type: str = "application/octet-stream", timeout: float = 30.0) -> Any:
+    """Stream a multipart/form-data POST to the configured client_manager using chunked encoding.
+    body will be an iterator yielding bytes: preamble -> file chunks -> epilogue.
+    This avoids loading the whole file into memory.
+    """
+    base = os.getenv("CM_BASE_URL", "http://127.0.0.1:10000")
+    from urllib.parse import urlparse as _parse
+    b = _parse(base)
+    scheme = (b.scheme or "http").lower()
+    host = b.hostname or "127.0.0.1"
+    port = b.port or (443 if scheme == "https" else 80)
+    if not path.startswith("/"):
+        path = "/" + path
+
+    boundary = "----boundary" + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+    crlf = "\r\n"
+
+    # prepare preamble (fields + file header)
+    pre_parts = []
+    for k, v in (fields or {}).items():
+        pre_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{k}\"{crlf}{crlf}{v}")
+    pre_parts.append(f"--{boundary}{crlf}Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"{crlf}Content-Type: {file_content_type}{crlf}{crlf}")
+    preamble = crlf.join(pre_parts).encode("utf-8")
+    epilogue = (crlf + f"--{boundary}--{crlf}").encode("utf-8")
+
+    hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}", "Transfer-Encoding": "chunked"}
+
+    if scheme == "https":
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
+    def body_iter():
+        yield preamble
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        yield epilogue
+
+    try:
+        # Use encode_chunked to stream the iterable body
+        conn.request('POST', path, body=body_iter(), headers=hdrs, encode_chunked=True)
+        resp = conn.getresponse()
+        data = resp.read()
+        text = data.decode("utf-8") if data else ""
+        if 200 <= resp.status < 300:
+            return json.loads(text) if text else None
+        raise HTTPException(status_code=resp.status, detail=text or "Upstream error")
+    except (TimeoutError, ConnectionError, OSError) as e:
+        raise HTTPException(status_code=503, detail=f"Client manager unavailable: {str(e)}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+
 class ClientAdmin(ModelView, model=Client):
     column_list = [Client.id, Client.hostname, Client.ip, Client.port, Client.status, Client.last_heartbeat]
     name_plural = "Clients"
@@ -437,24 +501,36 @@ def create_admin_app(orchestrator) -> FastAPI:
 
         try:
             original_name = file.filename
-            # Прочитаем файл в память (подходит для dev/small files). Для больших
-            # файлов можно реализовать стриминг.
-            file_bytes = await file.read()
+            # Сохраним входящий файл во временный файл на диске и будем стримить его
+            import tempfile
+            tmp_dir = os.getenv("UPLOAD_TMP_DIR", "/tmp")
+            fd, tmp_path = tempfile.mkstemp(prefix="upload_", dir=tmp_dir)
+            os.close(fd)
+            with open(tmp_path, "wb") as out_f:
+              # copy in chunks from the UploadFile.file (which is a SpooledTemporaryFile)
+              import shutil
+              await file.seek(0)
+              shutil.copyfileobj(file.file, out_f)
             await file.close()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Не удалось прочитать файл: {e}")
 
         fields = {
-            "client_id": client_id,
-            "path": dest_path,
-            "original_filename": original_name or "",
-            "direction": "upload",
+          "client_id": client_id,
+          "path": dest_path,
+          "original_filename": original_name or "",
+          "direction": "upload",
         }
         try:
-            data = await asyncio.to_thread(_http_multipart, "/api/files/upload/init", fields, "file", original_name or "upload.bin", file_bytes)
-            return JSONResponse(data)
+          data = await asyncio.to_thread(_http_multipart_stream, "/api/files/upload/init", fields, "file", original_name or "upload.bin", tmp_path)
+          return JSONResponse(data)
         except HTTPException as he:
-            raise he
+          raise he
+        finally:
+          try:
+            os.remove(tmp_path)
+          except Exception:
+            pass
 
     @app.post("/api/files/upload/init")
     async def upload_init_proxy(request: Request):
