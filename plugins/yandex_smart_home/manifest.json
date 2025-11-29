@@ -1,0 +1,24 @@
+{
+  "name": "yandex_smart_home",
+  "version": "0.1.0",
+  "description": "Yandex Smart Home adapter (skeleton) - OAuth + intent mapping",
+  "actions": {
+    "yandex.switch.toggle": {
+      "description": "Toggle a smart switch via Yandex Smart Home",
+      "payload_schema": {
+        "type": "object",
+        "properties": {
+          "device_id": { "type": "string" },
+          "on": { "type": "boolean" }
+        },
+        "required": ["device_id", "on"]
+      }
+    },
+    "yandex.light.set_brightness": {
+      "description": "Set brightness",
+      "payload_schema": { "type": "object", "properties": { "device_id": { "type": "string" }, "brightness": { "type": "integer", "minimum": 0, "maximum": 100 } }, "required": ["device_id", "brightness"] }
+    }
+  },
+  "capabilities": ["oauth", "device_discovery", "actions"],
+  "required_env": ["YANDEX_CLIENT_ID", "YANDEX_CLIENT_SECRET", "YANDEX_REDIRECT_URI"]
+}

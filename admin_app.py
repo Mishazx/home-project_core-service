@@ -20,6 +20,9 @@ from sqladmin import Admin, ModelView
 
 from .db import engine, get_session
 from .models import Base, Client, CommandLog, Enrollment, TerminalAudit
+from .models import Plugin, PluginVersion, PluginInstallJob
+# Plugin loader (MVP)
+from .plugins.loader import PluginLoader
 import random
 import string
 
@@ -228,6 +231,365 @@ def create_admin_app(orchestrator) -> FastAPI:
     admin.add_view(ClientAdmin)
     admin.add_view(CommandLogAdmin)
     admin.add_view(EnrollmentAdmin)
+
+    # Initialize plugin loader (scans core_service/plugins directory)
+    try:
+      plugins_dir = os.path.join(os.path.dirname(__file__), 'plugins')
+      plugin_loader = PluginLoader(plugins_dir)
+    except Exception:
+      plugin_loader = PluginLoader()
+
+    @app.get('/api/plugins')
+    async def list_plugins():
+      # Return plugins from registry (DB) if available, otherwise fall back to filesystem loader
+      try:
+        from sqlalchemy import select
+        with get_session() as db:
+          q = db.execute(select(Plugin)).scalars().all()
+          result = {}
+          for p in q:
+            # fetch versions
+            vs = db.execute(select(PluginVersion).where(PluginVersion.plugin_name == p.name)).scalars().all()
+            result[p.name] = {
+              'name': p.name,
+              'description': p.description,
+              'publisher': p.publisher,
+              'latest_version': p.latest_version,
+              'versions': [{ 'version': v.version, 'artifact_url': v.artifact_url, 'created_at': v.created_at.isoformat() if v.created_at else None } for v in vs]
+            }
+      except Exception:
+        data = plugin_loader.list_plugins()
+        return {k: dict(v) for k, v in data.items()}
+      return result
+
+    @app.post('/api/registry/plugins')
+    async def registry_publish(payload: Dict[str, Any]):
+      """Publish a plugin manifest to the registry.
+
+      Expected JSON: { "name": "plugin_name", "version": "1.0.0", "manifest": { ... }, "artifact_url": "https://..." , "publisher": "me" }
+      """
+      name = (payload or {}).get('name')
+      version = (payload or {}).get('version')
+      manifest = (payload or {}).get('manifest')
+      artifact_url = (payload or {}).get('artifact_url')
+      publisher = (payload or {}).get('publisher')
+      # Optional manifest fields: type, entrypoint, install_cmd
+      if not name or not version or not manifest:
+        raise HTTPException(status_code=400, detail='name, version and manifest are required')
+
+      # Basic manifest validation: enforce known types and common fields
+      allowed_types = {'node', 'python', 'docker', 'git', 'zip', 'binary', 'wasm'}
+      mtype = manifest.get('type') or (payload or {}).get('type') or None
+      if mtype and mtype not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Unsupported manifest type: {mtype}")
+      # Normalize manifest fields
+      entrypoint = manifest.get('entrypoint') or manifest.get('main') or None
+      install_cmd = manifest.get('install_cmd') or manifest.get('install') or None
+      try:
+        from sqlalchemy import select
+        with get_session() as db:
+          # upsert plugin
+          existing = db.execute(select(Plugin).where(Plugin.name == name)).scalars().first()
+          if not existing:
+            p = Plugin(id=name, name=name, description=manifest.get('description'), publisher=publisher, latest_version=version)
+            db.add(p)
+          else:
+            existing.description = manifest.get('description') or existing.description
+            existing.latest_version = version
+            db.add(existing)
+
+          pv_id = f"{name}:{version}"
+          pv = PluginVersion(id=pv_id, plugin_name=name, version=version, manifest=manifest, artifact_url=artifact_url, type=mtype)
+          db.add(pv)
+          db.commit()
+      except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed saving plugin: {e}')
+
+      return JSONResponse({'status': 'ok', 'plugin': name, 'version': version})
+
+    @app.get('/api/registry/plugins/{name}')
+    async def registry_get(name: str):
+      try:
+        from sqlalchemy import select
+        with get_session() as db:
+          p = db.execute(select(Plugin).where(Plugin.name == name)).scalars().first()
+          if not p:
+            raise HTTPException(status_code=404, detail='plugin not found')
+          vs = db.execute(select(PluginVersion).where(PluginVersion.plugin_name == name)).scalars().all()
+          return JSONResponse({ 'name': p.name, 'description': p.description, 'publisher': p.publisher, 'latest_version': p.latest_version, 'versions': [ { 'version': v.version, 'artifact_url': v.artifact_url, 'created_at': v.created_at.isoformat() } for v in vs ] })
+      except HTTPException:
+        raise
+      except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post('/api/registry/plugins/{name}/{version}/install')
+        async def install_registry_plugin(request: Request, name: str, version: str):
+          """Create a PluginInstallJob and forward install request to the client_manager agent.
+
+          Body: {"agent_id": "agent-123", "options": { ... }}
+          """
+          try:
+            payload = await request.json()
+          except Exception:
+            payload = {}
+          agent_id = payload.get('agent_id')
+          options = payload.get('options') or {}
+
+          from sqlalchemy import select
+          with get_session() as db:
+            pv = db.execute(select(PluginVersion).where(PluginVersion.plugin_name == name, PluginVersion.version == version)).scalars().first()
+            if not pv:
+              raise HTTPException(status_code=404, detail='plugin/version not found')
+
+            import uuid
+            job_id = str(uuid.uuid4())
+            from datetime import datetime
+            job = PluginInstallJob(id=job_id, plugin_name=name, version=version, target_agent=agent_id, status='pending', created_at=datetime.utcnow())
+            db.add(job)
+            db.commit()
+
+          # prepare message for client_manager
+          msg = {
+            'message': {
+              'type': 'admin.install_plugin',
+              'data': {
+                'plugin_name': name,
+                'version': version,
+                'manifest': pv.manifest,
+                'artifact_url': pv.artifact_url,
+                'type': pv.type,
+                'options': options,
+                'install_job_id': job_id,
+              }
+            },
+            'client_id': agent_id,
+          }
+
+          # Build auth headers (reuse ADMIN_JWT_SECRET or ADMIN_TOKEN patterns)
+          headers = {}
+          admin_jwt_secret = os.getenv('ADMIN_JWT_SECRET', '')
+          admin_token = os.getenv('ADMIN_TOKEN', '')
+          if admin_jwt_secret:
+            alg = os.getenv('ADMIN_JWT_ALG', 'HS256').upper()
+            try:
+              import jwt as _pyjwt  # type: ignore
+            except Exception:
+              _pyjwt = None
+
+            priv = None
+            if alg == 'RS256':
+              priv = os.getenv('ADMIN_JWT_PRIVATE_KEY') or None
+              priv_file = os.getenv('ADMIN_JWT_PRIVATE_KEY_FILE') or None
+              if not priv and priv_file:
+                try:
+                  with open(priv_file, 'r') as f:
+                    priv = f.read()
+                except Exception:
+                  priv = None
+              if not priv:
+                alg = 'HS256'
+
+            if alg == 'RS256' and _pyjwt and priv:
+              jwt_payload = {
+                'iss': 'core_service',
+                'sub': f'install:{agent_id}',
+                'aud': 'client_manager',
+                'iat': int(time.time()),
+                'exp': int(time.time()) + 120,
+                'jti': str(uuid.uuid4())
+              }
+              token = _pyjwt.encode(jwt_payload, priv, algorithm='RS256')
+              headers = {'Authorization': f'Bearer {token}'}
+            else:
+              # HS256 fallback (shared secret)
+              def _b64u(data: bytes) -> str:
+                return base64.urlsafe_b64encode(data).rstrip(b"=").decode('utf-8')
+
+              header = {'alg': 'HS256', 'typ': 'JWT'}
+              jwt_claims = {
+                'iss': 'core_service',
+                'sub': f'install:{agent_id}',
+                'aud': 'client_manager',
+                'iat': int(time.time()),
+                'exp': int(time.time()) + 120,
+                'jti': str(uuid.uuid4())
+              }
+              header_b = _b64u(json.dumps(header).encode('utf-8'))
+              payload_b = _b64u(json.dumps(jwt_claims).encode('utf-8'))
+              signing = (header_b + '.' + payload_b).encode('utf-8')
+              sig = hmac.new(admin_jwt_secret.encode('utf-8'), signing, hashlib.sha256).digest()
+              sig_b = _b64u(sig)
+              jwt_token = header_b + '.' + payload_b + '.' + sig_b
+              headers = {'Authorization': f'Bearer {jwt_token}'}
+          elif admin_token:
+            headers = {'Authorization': f'Bearer {admin_token}'}
+
+          try:
+            resp = await asyncio.to_thread(_http_json, 'POST', '/api/admin/send_message', body=msg, headers=headers)
+          except HTTPException as he:
+            # mark job failed
+            with get_session() as db:
+              j = db.get(PluginInstallJob, job_id)
+              if j:
+                j.status = 'failed'
+                j.logs = str(he.detail)
+                from datetime import datetime
+                j.finished_at = datetime.utcnow()
+                db.add(j)
+                db.commit()
+            raise
+
+          # update job as sent
+          with get_session() as db:
+            j = db.get(PluginInstallJob, job_id)
+            if j:
+              j.status = 'sent'
+              try:
+                j.logs = json.dumps(resp)
+              except Exception:
+                j.logs = str(resp)
+              from datetime import datetime
+              j.started_at = datetime.utcnow()
+              db.add(j)
+              db.commit()
+
+          return JSONResponse({'ok': True, 'job_id': job_id, 'forward': resp})
+
+        @app.get('/api/registry/plugins/install/{job_id}')
+        async def get_install_job_status(job_id: str):
+          with get_session() as db:
+            j = db.get(PluginInstallJob, job_id)
+            if not j:
+              raise HTTPException(status_code=404, detail='job not found')
+            return JSONResponse({
+              'id': j.id,
+              'plugin_name': j.plugin_name,
+              'version': j.version,
+              'target_agent': j.target_agent,
+              'status': j.status,
+              'logs': j.logs,
+              'created_at': j.created_at.isoformat() if j.created_at else None,
+              'started_at': j.started_at.isoformat() if j.started_at else None,
+              'finished_at': j.finished_at.isoformat() if j.finished_at else None,
+            })
+
+            @app.post('/api/registry/plugins/install/callback')
+            async def install_job_callback(payload: Dict[str, Any]):
+              """Callback endpoint for client_manager to update install job status.
+
+              Expected JSON: {"install_job_id":"...","status":"running|success|failed","logs":"...","agent_id":"...","finished_at":"iso8601"}
+              This endpoint MUST be protected by internal auth in production (ADMIN_TOKEN / mTLS / JWT).
+              """
+              jid = (payload or {}).get('install_job_id')
+              if not jid:
+                raise HTTPException(status_code=400, detail='install_job_id required')
+              status = (payload or {}).get('status') or 'running'
+              logs = (payload or {}).get('logs')
+              agent_id = (payload or {}).get('agent_id')
+              finished_at = (payload or {}).get('finished_at')
+
+              from datetime import datetime
+              with get_session() as db:
+                job = db.get(PluginInstallJob, jid)
+                if not job:
+                  raise HTTPException(status_code=404, detail='job not found')
+                # Accept transitions: pending -> sent -> running -> success/failed
+                job.status = status
+                if logs:
+                  # append to existing logs
+                  try:
+                    prev = job.logs or ''
+                    job.logs = prev + "\n" + str(logs)
+                  except Exception:
+                    job.logs = str(logs)
+                if status in ('success', 'failed'):
+                  job.finished_at = datetime.fromisoformat(finished_at) if finished_at else datetime.utcnow()
+                if status == 'running' and not job.started_at:
+                  job.started_at = datetime.utcnow()
+                if agent_id:
+                  job.target_agent = agent_id
+                db.add(job)
+                db.commit()
+
+              return JSONResponse({'ok': True, 'id': jid, 'status': status})
+
+    # --- Yandex Smart Home plugin endpoints (skeleton) ---
+    try:
+      from .plugins.yandex_smart_home import handler as yandex_handler
+    except Exception:
+      yandex_handler = None
+
+    @app.get('/api/plugins/yandex/start_oauth')
+    async def yandex_start_oauth():
+      if not yandex_handler:
+        raise HTTPException(status_code=404, detail='Yandex plugin not available')
+      return await yandex_handler.oauth_start()
+
+    @app.post('/api/plugins/yandex/callback')
+    async def yandex_oauth_callback(request: Request):
+      if not yandex_handler:
+        raise HTTPException(status_code=404, detail='Yandex plugin not available')
+      return await yandex_handler.oauth_callback(request)
+
+    @app.get('/api/plugins/yandex/devices')
+    async def yandex_list_devices():
+      if not yandex_handler:
+        raise HTTPException(status_code=404, detail='Yandex plugin not available')
+      return await yandex_handler.list_devices_proxy()
+
+    @app.post('/api/plugins/yandex/execute')
+    async def yandex_execute(payload: Dict[str, Any]):
+      if not yandex_handler:
+        raise HTTPException(status_code=404, detail='Yandex plugin not available')
+      return await yandex_handler.execute_action(payload or {})
+
+    @app.post('/api/plugins/yandex/bind')
+    async def yandex_bind(payload: Dict[str, Any]):
+      """Bind a Yandex device to an internal resource/agent.
+
+      Example payload: { "device_id": "...", "resource_id": "...", "agent_id": "..." }
+      This is a minimal MVP: stores binding into a JSON file inside the plugin folder.
+      """
+      device_id = (payload or {}).get('device_id')
+      resource_id = (payload or {}).get('resource_id')
+      agent_id = (payload or {}).get('agent_id')
+      if not device_id or not resource_id:
+        raise HTTPException(status_code=400, detail='device_id and resource_id required')
+
+      # Build bindings file path
+      try:
+        plugin_dir = os.path.join(os.path.dirname(__file__), 'plugins', 'yandex_smart_home')
+        os.makedirs(plugin_dir, exist_ok=True)
+        bindings_file = os.path.join(plugin_dir, 'bindings.json')
+        try:
+          if os.path.exists(bindings_file):
+            with open(bindings_file, 'r', encoding='utf-8') as f:
+              data = json.load(f) or []
+          else:
+            data = []
+        except Exception:
+          data = []
+
+        entry = { 'device_id': device_id, 'resource_id': resource_id, 'agent_id': agent_id }
+        data.append(entry)
+        with open(bindings_file, 'w', encoding='utf-8') as f:
+          json.dump(data, f, ensure_ascii=False, indent=2)
+
+        return JSONResponse({'status': 'ok', 'binding': entry})
+      except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed saving binding: {e}')
+
+    @app.post('/api/plugins/install')
+    async def install_plugin(payload: Dict[str, Any]):
+      """Install plugin from git: {"git_url": "https://..."}
+
+      This is an MVP implementation: clones repo into plugins dir.
+      """
+      git_url = (payload or {}).get('git_url')
+      if not git_url:
+        raise HTTPException(status_code=400, detail='git_url required')
+      res = await asyncio.to_thread(plugin_loader.install_from_git, git_url)
+      return JSONResponse(res)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
