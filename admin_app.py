@@ -532,11 +532,14 @@ def create_admin_app(orchestrator) -> FastAPI:
         Expected payload keys: `install_token` (string, required by agent), optional `dry_run` (bool),
         `socket`, `sessions_dir`, `token_file`.
         """
-        # Validate admin auth configuration: require either ADMIN_TOKEN or ADMIN_JWT_SECRET
+        # Validate admin auth configuration: require either ADMIN_TOKEN, ADMIN_JWT_SECRET,
+        # or RS256 private key configured via ADMIN_JWT_ALG=RS256 and ADMIN_JWT_PRIVATE_KEY(_FILE).
         admin_token = os.getenv("ADMIN_TOKEN", "")
         admin_jwt_secret = os.getenv("ADMIN_JWT_SECRET", "")
-        if not admin_token and not admin_jwt_secret:
-          raise HTTPException(status_code=403, detail="Server ADMIN_TOKEN or ADMIN_JWT_SECRET not configured")
+        admin_jwt_alg = os.getenv('ADMIN_JWT_ALG', '').upper()
+        admin_jwt_priv = os.getenv('ADMIN_JWT_PRIVATE_KEY') or os.getenv('ADMIN_JWT_PRIVATE_KEY_FILE')
+        if not admin_token and not admin_jwt_secret and not (admin_jwt_alg == 'RS256' and admin_jwt_priv):
+          raise HTTPException(status_code=403, detail="Server ADMIN_TOKEN, ADMIN_JWT_SECRET, or RS256 private key not configured")
 
         # Build message for client_manager
         msg = {
