@@ -2,6 +2,11 @@ from typing import Any, Dict
 import os
 import asyncio
 import json
+import time
+import base64
+import hmac
+import hashlib
+import uuid
 from urllib.parse import urlencode
 
 import http.client
@@ -258,6 +263,10 @@ def create_admin_app(orchestrator) -> FastAPI:
                 <div id=\"clients\">Загрузка...</div>
               </div>
             </div>
+            <div style="margin-top:12px">
+              <h3>Remote Actions</h3>
+              <div id="remote_actions">Remote actions will appear here</div>
+            </div>
             <div class=\"card\" style=\"margin-top:24px\">
               <h2>История команд</h2>
               <div id=\"history\">Загрузка...</div>
@@ -306,13 +315,36 @@ def create_admin_app(orchestrator) -> FastAPI:
                 el.innerHTML = data.map(c => `
                   <div class=\"row\">
                     <b>${c.hostname}</b> <code>(${c.id})</code> — ${c.status}
-                    <div>
+                      <button onclick="cancelCmd('${c.id}')">Отменить</button>
+                      <button onclick="installPtyManager('${c.id}')">Install PTY Manager</button>
                       <input id=\"cmd_${c.id}\" placeholder=\"Команда\" />
                       <button onclick=\"sendCmd('${c.id}')\">Выполнить</button>
                       <button onclick=\"cancelCmd('${c.id}')\">Отменить</button>
                     </div>
                   </div>
                 `).join('');
+              }
+
+              async function installPtyManager(clientId) {
+                const installToken = prompt('Install token to send to agent (must match ALLOW_REMOTE_INSTALL_TOKEN on host):');
+                if (installToken === null) return;
+                // Step 1: dry-run
+                const body = { install_token: installToken, dry_run: true };
+                try {
+                  const resp = await fetch(`/api/clients/${clientId}/install`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+                  const j = await resp.json();
+                  const forwarded = j.forwarded || j;
+                  const details = JSON.stringify(forwarded, null, 2).substring(0, 2000);
+                  const proceed = confirm('Dry-run result:\n' + details + '\n\nApply real install on host?');
+                  if (!proceed) return;
+
+                  // Step 2: real install (confirm)
+                  const resp2 = await fetch(`/api/clients/${clientId}/install`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ install_token: installToken, dry_run: false }) });
+                  const j2 = await resp2.json();
+                  alert('Install applied: ' + JSON.stringify(j2));
+                } catch (e) {
+                  alert('Install request failed: ' + e.message);
+                }
               }
 
               async function sendCmd(id) {
@@ -492,6 +524,122 @@ def create_admin_app(orchestrator) -> FastAPI:
             await asyncio.to_thread(_postlog)
 
         return JSONResponse(data)
+
+    @app.post("/api/clients/{client_id}/install")
+    async def client_install(client_id: str, payload: Dict[str, Any]) -> JSONResponse:
+        """Trigger a remote install on the agent by forwarding an admin.install_service message.
+
+        Expected payload keys: `install_token` (string, required by agent), optional `dry_run` (bool),
+        `socket`, `sessions_dir`, `token_file`.
+        """
+        # Validate admin auth configuration: require either ADMIN_TOKEN or ADMIN_JWT_SECRET
+        admin_token = os.getenv("ADMIN_TOKEN", "")
+        admin_jwt_secret = os.getenv("ADMIN_JWT_SECRET", "")
+        if not admin_token and not admin_jwt_secret:
+          raise HTTPException(status_code=403, detail="Server ADMIN_TOKEN or ADMIN_JWT_SECRET not configured")
+
+        # Build message for client_manager
+        msg = {
+            "client_id": client_id,
+            "message": {
+                "type": "admin.install_service",
+                "data": {
+                    "install_token": payload.get("install_token"),
+                    "dry_run": payload.get("dry_run", True),
+                    "socket": payload.get("socket"),
+                    "sessions_dir": payload.get("sessions_dir"),
+                    "token_file": payload.get("token_file"),
+                },
+            },
+        }
+
+        # Forward to client_manager internal endpoint
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        try:
+          # Use signed JWT when ADMIN_JWT_SECRET is configured; else fallback to ADMIN_TOKEN
+          admin_jwt_secret = os.getenv('ADMIN_JWT_SECRET', '')
+          headers = {}
+          if admin_jwt_secret:
+            # Determine if we should use RS256 (private key) or HS256 (shared secret)
+            alg = os.getenv('ADMIN_JWT_ALG', 'HS256').upper()
+            # Try PyJWT for RS256/HS256 handling
+            try:
+              import jwt as _pyjwt  # type: ignore
+            except Exception:
+              _pyjwt = None
+
+            if alg == 'RS256':
+              # Read private key from env or file
+              priv = os.getenv('ADMIN_JWT_PRIVATE_KEY') or None
+              priv_file = os.getenv('ADMIN_JWT_PRIVATE_KEY_FILE') or None
+              if not priv and priv_file:
+                try:
+                  with open(priv_file, 'r') as f:
+                    priv = f.read()
+                except Exception:
+                  priv = None
+              if not priv:
+                # Fallback to HS256 approach if no private key provided
+                alg = 'HS256'
+
+            if alg == 'RS256' and _pyjwt:
+              jwt_payload = {
+                'iss': 'core_service',
+                'sub': f'install:{client_id}',
+                'aud': 'client_manager',
+                'iat': int(time.time()),
+                'exp': int(time.time()) + 120,
+                'jti': str(uuid.uuid4())
+              }
+              token = _pyjwt.encode(jwt_payload, priv, algorithm='RS256')
+              headers = {'Authorization': f'Bearer {token}'}
+            else:
+              # HS256 fallback (shared secret)
+              def _b64u(data: bytes) -> str:
+                return base64.urlsafe_b64encode(data).rstrip(b"=").decode('utf-8')
+
+              header = {'alg': 'HS256', 'typ': 'JWT'}
+              jwt_claims = {
+                'iss': 'core_service',
+                'sub': f'install:{client_id}',
+                'aud': 'client_manager',
+                'iat': int(time.time()),
+                'exp': int(time.time()) + 120,
+                'jti': str(uuid.uuid4())
+              }
+              header_b = _b64u(json.dumps(header).encode('utf-8'))
+              payload_b = _b64u(json.dumps(jwt_claims).encode('utf-8'))
+              signing = (header_b + '.' + payload_b).encode('utf-8')
+              sig = hmac.new(admin_jwt_secret.encode('utf-8'), signing, hashlib.sha256).digest()
+              sig_b = _b64u(sig)
+              jwt_token = header_b + '.' + payload_b + '.' + sig_b
+              headers = {'Authorization': f'Bearer {jwt_token}'}
+          else:
+            admin_token = os.getenv('ADMIN_TOKEN', '')
+            if admin_token:
+              headers = {"Authorization": f"Bearer {admin_token}"}
+
+          data = await asyncio.to_thread(_http_json, 'POST', '/api/admin/send_message', body=msg, headers=headers)
+        except HTTPException as he:
+            raise he
+
+        # Audit log: save CommandLog-like entry
+        try:
+            from datetime import datetime
+
+            def _log():
+                with get_session() as db:
+                    import uuid
+
+                    cid = f"install_{uuid.uuid4().hex}"
+                    log = CommandLog(id=cid, client_id=client_id, command="install_pty_manager", status="sent")
+                    db.merge(log)
+
+            await asyncio.to_thread(_log)
+        except Exception:
+            pass
+
+        return JSONResponse({"ok": True, "forwarded": data})
 
     @app.post("/admin/api/commands/{client_id}")
     async def command_exec_compat(client_id: str, payload: Dict[str, Any]) -> JSONResponse:
