@@ -1,10 +1,11 @@
+---
 name: CI Build and Publish
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   pull_request:
-    branches: [ master ]
+    branches: [master]
 
 permissions:
   contents: read
@@ -12,7 +13,9 @@ permissions:
 
 jobs:
   build-and-publish:
-    runs-on: [self-hosted, Linux]
+    runs-on: [self-hosted, linux]
+    env:
+      IMAGE_REF: ghcr.io/${{ github.repository_owner }}/core-service
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,14 +25,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        - name: Cache pip
-          uses: actions/cache@v4
-          with:
-            path: ~/.cache/pip
-            key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-            restore-keys: |
-              ${{ runner.os }}-pip-
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         if: always()
@@ -62,12 +64,12 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/${{ github.repository_owner }}/core-service:latest
-            ghcr.io/${{ github.repository_owner }}/core-service:${{ github.sha }}
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/core-service:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/core-service:buildcache,mode=max
+            ${{ env.IMAGE_REF }}:latest
+            ${{ env.IMAGE_REF }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_REF }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_REF }}:buildcache,mode=max
 
       - name: Output published image names
         run: |
-          echo "Published: ghcr.io/${{ github.repository_owner }}/core-service:latest"
-          echo "Published: ghcr.io/${{ github.repository_owner }}/core-service:${{ github.sha }}"
+          echo "Published: ${{ env.IMAGE_REF }}:latest"
+          echo "Published: ${{ env.IMAGE_REF }}:${{ github.sha }}"
