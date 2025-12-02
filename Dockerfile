@@ -8,9 +8,10 @@ WORKDIR /app
 # Установим системные зависимости
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
 
-# Копируем только зависимости для кеша
+# Копируем только зависимости для кеша и используем BuildKit cache для pip
+# Требует buildx/BuildKit, но workflow использует buildx
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install --no-cache-dir -r /app/requirements.txt
 
 # Код монтируется томом в dev. На проде можно раскомментировать COPY:
 RUN mkdir -p /app/core_service
